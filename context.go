@@ -24,11 +24,7 @@ func (nc *Conn) RequestMsgWithContext(ctx context.Context, msg *Msg) (*Msg, erro
 	if msg == nil {
 		return nil, ErrInvalidMsg
 	}
-	hdr, err := msg.headerBytes()
-	if err != nil {
-		return nil, err
-	}
-	return nc.requestWithContext(ctx, msg.Subject, hdr, msg.Data)
+	return nc.requestWithContext(ctx, msg.Subject, msg.Header, msg.Data)
 }
 
 // RequestWithContext takes a context, a subject and payload
@@ -37,7 +33,7 @@ func (nc *Conn) RequestWithContext(ctx context.Context, subj string, data []byte
 	return nc.requestWithContext(ctx, subj, nil, data)
 }
 
-func (nc *Conn) requestWithContext(ctx context.Context, subj string, hdr, data []byte) (*Msg, error) {
+func (nc *Conn) requestWithContext(ctx context.Context, subj string, header Header, data []byte) (*Msg, error) {
 	if ctx == nil {
 		return nil, ErrInvalidContext
 	}
@@ -55,9 +51,9 @@ func (nc *Conn) requestWithContext(ctx context.Context, subj string, hdr, data [
 
 	// If user wants the old style.
 	if nc.useOldRequestStyle() {
-		m, err = nc.oldRequestWithContext(ctx, subj, hdr, data)
+		m, err = nc.oldRequestWithContext(ctx, subj, header, data)
 	} else {
-		mch, token, err := nc.createNewRequestAndSend(subj, hdr, data)
+		mch, token, err := nc.createNewRequestAndSend(subj, header, data)
 		if err != nil {
 			return nil, err
 		}
@@ -84,7 +80,7 @@ func (nc *Conn) requestWithContext(ctx context.Context, subj string, hdr, data [
 }
 
 // oldRequestWithContext utilizes inbox and subscription per request.
-func (nc *Conn) oldRequestWithContext(ctx context.Context, subj string, hdr, data []byte) (*Msg, error) {
+func (nc *Conn) oldRequestWithContext(ctx context.Context, subj string, header Header, data []byte) (*Msg, error) {
 	inbox := nc.NewInbox()
 	ch := make(chan *Msg, RequestChanLen)
 
@@ -95,7 +91,7 @@ func (nc *Conn) oldRequestWithContext(ctx context.Context, subj string, hdr, dat
 	s.AutoUnsubscribe(1)
 	defer s.Unsubscribe()
 
-	err = nc.publish(subj, inbox, false, hdr, data)
+	err = nc.publish(subj, inbox, false, header, data)
 	if err != nil {
 		return nil, err
 	}

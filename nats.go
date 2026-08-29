@@ -855,63 +855,38 @@ func (m *Msg) Size() int {
 	if m.wsz != 0 {
 		return m.wsz
 	}
-	hdrSize, _ := m.headerSize()
+	hdrSize, _ := headerSize(m.Header)
 	return len(m.Subject) + len(m.Reply) + hdrSize + len(m.Data)
 }
 
-// Validate the keys and calculate an upper bound for the total encoded
-// size.
+// Validate the keys and calculate an exact total encoded size.
 //
-// Trimm leading/tailing whitespaces right away, so the size calculation
-// is exact.
+// Trim leading/trailing whitespace, and sanitize any embedded '\r' or
+// '\n' characters (replacing them with a space) right away, so the size
+// calculation is exact and the values can later be serialized as-is,
+// without any further processing (see natsWriter.appendHeaders).
 //
 // We don't perform any special validation on header values because we
 // consider all strings to be valid values (including Unicode strings,
 // special characters, etc.).
-func (m *Msg) headerSize() (int, error) {
-	if len(m.Header) == 0 {
+func headerSize(header Header) (int, error) {
+	if len(header) == 0 {
 		return 0, nil
 	}
 
 	hdrSize := len(hdrLine) + len(crlf)
-	for k, vs := range m.Header {
+	for k, vs := range header {
 		if !isHeaderKeyValid(k) {
 			return 0, ErrBadHeaderMsg
 		}
 		for i, v := range vs {
-			vs[i] = textproto.TrimString(v)
-			hdrSize += len(k) + len(vs[i]) + 4 // 4 is for the colon, space, CR, and LF
+			v = headerValueNewlineReplacer.Replace(textproto.TrimString(v))
+			vs[i] = v
+			hdrSize += len(k) + len(v) + 4 // 4 is for the colon, space, CR, and LF
 		}
 	}
 
 	return hdrSize, nil
-}
-
-func (m *Msg) headerBytes() ([]byte, error) {
-	var hdr []byte
-	hdrSize, err := m.headerSize()
-	if hdrSize == 0 || err != nil {
-		return hdr, err
-	}
-
-	// NOTE: bytes.Buffer.WriteString() returns an error because bytes.Buffer
-	// is intended to be a valid implementation of the io.StringWriter interface.
-	// This implementation cannot actually fail in practice, so it is safe to
-	// ignore write errors here.
-	var b bytes.Buffer
-	b.Grow(hdrSize)
-	_, _ = b.WriteString(hdrLine)
-	for k, vs := range m.Header {
-		for _, v := range vs {
-			_, _ = b.WriteString(k)
-			_, _ = b.WriteString(": ")
-			writeHeaderValue(&b, v)
-			_, _ = b.WriteString(crlf)
-		}
-	}
-	_, _ = b.WriteString(crlf)
-
-	return b.Bytes(), nil
 }
 
 // asciiSet is a 256-byte lookup table for fast ASCII character membership testing.
@@ -998,20 +973,6 @@ func isHeaderKeyValid(k string) bool {
 }
 
 var headerValueNewlineReplacer = strings.NewReplacer("\r", " ", "\n", " ")
-
-func writeHeaderValue(buffer *bytes.Buffer, value string) {
-
-	// ADR-4 specifies that header values must be ASCII characters (except for
-	// '\r' or '\n'), however the Go implementation is slightly more lenient
-	// to maintain backwards compatibility with older versions of the library.
-	// We allow arbitrary UTF-8 strings to be used as values and deliberately
-	// sanitize '\r' and '\n' characters by replacing them with spaces.
-
-	// NOTE: It is safe to ignore the error returned by WriteString because
-	// we're writing to a bytes.Buffer object, and that implementation never
-	// returns an error.
-	_, _ = headerValueNewlineReplacer.WriteString(buffer, value)
-}
 
 type barrierInfo struct {
 	refs int64
@@ -2324,6 +2285,14 @@ func (w *natsWriter) appendString(str string) error {
 }
 
 func (w *natsWriter) appendBufs(bufs ...[]byte) error {
+	w.appendBufsNoFlush(bufs...)
+	if w.pending == nil && len(w.bufs) >= w.limit {
+		return w.flush()
+	}
+	return nil
+}
+
+func (w *natsWriter) appendBufsNoFlush(bufs ...[]byte) {
 	for _, buf := range bufs {
 		if len(buf) == 0 {
 			continue
@@ -2334,10 +2303,34 @@ func (w *natsWriter) appendBufs(bufs ...[]byte) error {
 			w.bufs = append(w.bufs, buf...)
 		}
 	}
-	if w.pending == nil && len(w.bufs) >= w.limit {
-		return w.flush()
+}
+
+func appendHeaderBlock(dst []byte, hdr Header) []byte {
+	dst = append(dst, hdrLine...)
+	for k, vs := range hdr {
+		for _, v := range vs {
+			dst = append(dst, k...)
+			dst = append(dst, ':', ' ')
+			dst = append(dst, v...)
+			dst = append(dst, crlf...)
+		}
 	}
-	return nil
+	return append(dst, crlf...)
+}
+
+func (w *natsWriter) appendHeaders(hdr Header) {
+	if len(hdr) == 0 {
+		return
+	}
+
+	if w.pending != nil {
+		buf := w.pending.AvailableBuffer()
+		buf = appendHeaderBlock(buf, hdr)
+		_, _ = w.pending.Write(buf)
+		return
+	}
+
+	w.bufs = appendHeaderBlock(w.bufs, hdr)
 }
 
 func (w *natsWriter) writeDirect(strs ...string) error {
@@ -4529,12 +4522,8 @@ func (nc *Conn) PublishMsg(m *Msg) error {
 	if m == nil {
 		return ErrInvalidMsg
 	}
-	hdr, err := m.headerBytes()
-	if err != nil {
-		return err
-	}
 	validateReply := m.Reply != _EMPTY_
-	return nc.publish(m.Subject, m.Reply, validateReply, hdr, m.Data)
+	return nc.publish(m.Subject, m.Reply, validateReply, m.Header, m.Data)
 }
 
 // PublishRequest will perform a Publish() expecting a response on the
@@ -4584,7 +4573,13 @@ func validateSubject(subj string) error {
 // publish is the internal function to publish messages to a nats-server.
 // Sends a protocol data message by queuing into the bufio writer
 // and kicking the flush go routine. These writes should be protected.
-func (nc *Conn) publish(subj, reply string, validateReply bool, hdr, data []byte) error {
+//
+// header and hdrSize describe an already-validated, already-normalized
+// header (see Msg.headerSize): callers must compute hdrSize beforehand,
+// outside of the connection lock, so that no header validation or
+// normalization work happens while nc.mu is held. hdrSize must be 0 if
+// and only if there is no header to send.
+func (nc *Conn) publish(subj, reply string, validateReply bool, header Header, data []byte) error {
 	if nc == nil {
 		return ErrInvalidConnection
 	}
@@ -4600,10 +4595,16 @@ func (nc *Conn) publish(subj, reply string, validateReply bool, hdr, data []byte
 	} else if subj == _EMPTY_ {
 		return ErrBadSubject
 	}
+
+	hdrSize, err := headerSize(header)
+	if err != nil {
+		return err
+	}
+
 	nc.mu.Lock()
 
 	// Check if headers attempted to be sent to server that does not support them.
-	if len(hdr) > 0 && !nc.info.Headers {
+	if hdrSize > 0 && !nc.info.Headers {
 		nc.mu.Unlock()
 		return ErrHeadersNotSupported
 	}
@@ -4619,7 +4620,7 @@ func (nc *Conn) publish(subj, reply string, validateReply bool, hdr, data []byte
 	}
 
 	// Proactively reject payloads over the threshold set by server.
-	msgSize := int64(len(data) + len(hdr))
+	msgSize := int64(len(data) + hdrSize)
 	// Skip this check if we are not yet connected (RetryOnFailedConnect)
 	if !nc.initc && msgSize > nc.info.MaxPayload {
 		nc.mu.Unlock()
@@ -4634,7 +4635,7 @@ func (nc *Conn) publish(subj, reply string, validateReply bool, hdr, data []byte
 	}
 
 	var mh []byte
-	if hdr != nil {
+	if hdrSize > 0 {
 		mh = nc.scratch[:len(_HPUB_P_)]
 	} else {
 		mh = nc.scratch[1:len(_HPUB_P_)]
@@ -4655,15 +4656,10 @@ func (nc *Conn) publish(subj, reply string, validateReply bool, hdr, data []byte
 	var b [12]byte
 	i := len(b)
 
-	if hdr != nil {
-		if len(hdr) > 0 {
-			for l := len(hdr); l > 0; l /= 10 {
-				i--
-				b[i] = digits[l%10]
-			}
-		} else {
+	if hdrSize > 0 {
+		for l := hdrSize; l > 0; l /= 10 {
 			i--
-			b[i] = digits[0]
+			b[i] = digits[l%10]
 		}
 		mh = append(mh, b[i:]...)
 		mh = append(mh, ' ')
@@ -4684,13 +4680,23 @@ func (nc *Conn) publish(subj, reply string, validateReply bool, hdr, data []byte
 	mh = append(mh, b[i:]...)
 	mh = append(mh, _CRLF_...)
 
-	if err := nc.bw.appendBufs(mh, hdr, data, _CRLF_BYTES_); err != nil {
+	// Allocate everything at once if we are going to append to the slice
+	total := len(mh) + hdrSize + len(data) + len(_CRLF_BYTES_)
+	if nc.bw.pending != nil {
+		nc.bw.pending.Grow(total)
+	} else {
+		nc.bw.bufs = slices.Grow(nc.bw.bufs, total)
+	}
+
+	nc.bw.appendBufsNoFlush(mh)
+	nc.bw.appendHeaders(header)
+	if err := nc.bw.appendBufs(data, _CRLF_BYTES_); err != nil {
 		nc.mu.Unlock()
 		return err
 	}
 
 	nc.OutMsgs++
-	nc.OutBytes += uint64(len(data) + len(hdr))
+	nc.OutBytes += uint64(len(data)) + uint64(hdrSize)
 
 	if len(nc.fch) == 0 {
 		nc.kickFlusher()
@@ -4742,7 +4748,7 @@ func (nc *Conn) respHandler(m *Msg) {
 }
 
 // Helper to setup and send new request style requests. Return the chan to receive the response.
-func (nc *Conn) createNewRequestAndSend(subj string, hdr, data []byte) (chan *Msg, string, error) {
+func (nc *Conn) createNewRequestAndSend(subj string, header Header, data []byte) (chan *Msg, string, error) {
 	nc.mu.Lock()
 	// Create new literal Inbox and map to a chan msg.
 	mch := make(chan *Msg, RequestChanLen)
@@ -4763,7 +4769,7 @@ func (nc *Conn) createNewRequestAndSend(subj string, hdr, data []byte) (chan *Ms
 	}
 	nc.mu.Unlock()
 
-	if err := nc.publish(subj, respInbox, false, hdr, data); err != nil {
+	if err := nc.publish(subj, respInbox, false, header, data); err != nil {
 		return nil, token, err
 	}
 
@@ -4776,12 +4782,7 @@ func (nc *Conn) RequestMsg(msg *Msg, timeout time.Duration) (*Msg, error) {
 	if msg == nil {
 		return nil, ErrInvalidMsg
 	}
-	hdr, err := msg.headerBytes()
-	if err != nil {
-		return nil, err
-	}
-
-	return nc.request(msg.Subject, hdr, msg.Data, timeout)
+	return nc.request(msg.Subject, msg.Header, msg.Data, timeout)
 }
 
 // Request will send a request payload and deliver the response message,
@@ -4797,7 +4798,7 @@ func (nc *Conn) useOldRequestStyle() bool {
 	return r
 }
 
-func (nc *Conn) request(subj string, hdr, data []byte, timeout time.Duration) (*Msg, error) {
+func (nc *Conn) request(subj string, header Header, data []byte, timeout time.Duration) (*Msg, error) {
 	if nc == nil {
 		return nil, ErrInvalidConnection
 	}
@@ -4806,9 +4807,9 @@ func (nc *Conn) request(subj string, hdr, data []byte, timeout time.Duration) (*
 	var err error
 
 	if nc.useOldRequestStyle() {
-		m, err = nc.oldRequest(subj, hdr, data, timeout)
+		m, err = nc.oldRequest(subj, header, data, timeout)
 	} else {
-		m, err = nc.newRequest(subj, hdr, data, timeout)
+		m, err = nc.newRequest(subj, header, data, timeout)
 	}
 
 	// Check for no responder status.
@@ -4818,8 +4819,8 @@ func (nc *Conn) request(subj string, hdr, data []byte, timeout time.Duration) (*
 	return m, err
 }
 
-func (nc *Conn) newRequest(subj string, hdr, data []byte, timeout time.Duration) (*Msg, error) {
-	mch, token, err := nc.createNewRequestAndSend(subj, hdr, data)
+func (nc *Conn) newRequest(subj string, header Header, data []byte, timeout time.Duration) (*Msg, error) {
+	mch, token, err := nc.createNewRequestAndSend(subj, header, data)
 	if err != nil {
 		return nil, err
 	}
@@ -4848,7 +4849,7 @@ func (nc *Conn) newRequest(subj string, hdr, data []byte, timeout time.Duration)
 // oldRequest will create an Inbox and perform a Request() call
 // with the Inbox reply and return the first reply received.
 // This is optimized for the case of multiple responses.
-func (nc *Conn) oldRequest(subj string, hdr, data []byte, timeout time.Duration) (*Msg, error) {
+func (nc *Conn) oldRequest(subj string, header Header, data []byte, timeout time.Duration) (*Msg, error) {
 	inbox := nc.NewInbox()
 	ch := make(chan *Msg, RequestChanLen)
 
@@ -4859,7 +4860,7 @@ func (nc *Conn) oldRequest(subj string, hdr, data []byte, timeout time.Duration)
 	s.AutoUnsubscribe(1)
 	defer s.Unsubscribe()
 
-	err = nc.publish(subj, inbox, false, hdr, data)
+	err = nc.publish(subj, inbox, false, header, data)
 	if err != nil {
 		return nil, err
 	}

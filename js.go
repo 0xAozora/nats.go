@@ -1136,11 +1136,7 @@ func (js *js) PublishMsgAsync(m *Msg, opts ...PubOpt) (PubAckFuture, error) {
 		}
 		id = reply[js.replyPrefixLen:]
 	}
-	hdr, err := m.headerBytes()
-	if err != nil {
-		return nil, err
-	}
-	if err := js.nc.publish(m.Subject, reply, false, hdr, m.Data); err != nil {
+	if err := js.nc.publish(m.Subject, reply, false, m.Header, m.Data); err != nil {
 		js.clearPAF(id)
 		return nil, err
 	}
