@@ -1648,18 +1648,21 @@ func TestHeaderMultiLine(t *testing.T) {
 	m.Header.Add("X-Test", "Second")
 	m.Header.Add("X-Test", "Third")
 
-	b, err := m.headerBytes()
+	hdrSize, err := headerSize(m.Header)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	b := make([]byte, 0, hdrSize)
+	b = appendHeaderBlock(b, m.Header)
 	result := string(b)
 
 	// Require the header string to have a known prefix and suffix
 	if !strings.HasPrefix(result, "NATS/1.0\r\n") {
-		t.Fatalf("header prefix not present")
+		t.Fatal("header prefix not present", result)
 	}
 	if !strings.HasSuffix(result, "\r\n\r\n") {
-		t.Fatalf("header suffix not present")
+		t.Fatal("header suffix not present", result)
 	}
 
 	// Require the header string to contain each of the following rows. Note
@@ -1693,7 +1696,7 @@ func TestHeaderValidKeys(t *testing.T) {
 	m.Header = Header{
 		validChars: []string{"value"},
 	}
-	if _, err := m.headerBytes(); err != nil {
+	if _, err := headerSize(m.Header); err != nil {
 		t.Fatal(err.Error())
 	}
 }
@@ -1714,7 +1717,7 @@ func TestHeaderInvalidKeys(t *testing.T) {
 		m.Header = Header{
 			key: []string{"value"},
 		}
-		if _, err := m.headerBytes(); err == nil {
+		if _, err := headerSize(m.Header); err == nil {
 			t.Fatalf("expected error for key '%s'", key)
 		}
 	}
@@ -1732,7 +1735,7 @@ func TestHeaderValidValues(t *testing.T) {
 		m.Header = Header{
 			"key": []string{v},
 		}
-		if _, err := m.headerBytes(); err != nil {
+		if _, err := headerSize(m.Header); err != nil {
 			t.Fatal(err.Error())
 		}
 	}
@@ -1742,10 +1745,12 @@ func TestHeaderNewlineValue(t *testing.T) {
 	m := NewMsg("foo")
 	m.Header.Set("X-Test", "line1\nline2\rline3")
 
-	b, err := m.headerBytes()
+	hdrSize, err := headerSize(m.Header)
 	if err != nil {
 		t.Fatal(err.Error())
 	}
+	b := make([]byte, 0, hdrSize)
+	b = appendHeaderBlock(b, m.Header)
 	out := string(b)
 	if !strings.Contains(out, "X-Test: line1 line2 line3") {
 		t.Fatalf("expected sanitized 'X-Test: line1 line2 line3', got: %q", out)
@@ -1875,11 +1880,13 @@ func BenchmarkHeaderDecode(b *testing.B) {
 
 			m := NewMsg("foo")
 			m.Header = bm.header
-			hdr, err := m.headerBytes()
+			hdrSize, err := headerSize(m.Header)
 			if err != nil {
 				b.Fatalf("Unexpected error: %v", err)
 			}
 
+			hdr := make([]byte, 0, hdrSize)
+			hdr = appendHeaderBlock(hdr, m.Header)
 			for i := 0; i < b.N; i++ {
 				if _, err := DecodeHeadersMsg(hdr); err != nil {
 					b.Fatalf("Unexpected error: %v", err)
